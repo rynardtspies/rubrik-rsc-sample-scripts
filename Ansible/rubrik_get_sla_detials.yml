@@ -1,0 +1,61 @@
+---
+- name: Rubrik SLA Details Playbook
+  hosts: localhost
+  connection: localhost
+  gather_facts: no
+  
+  tasks:
+    - name: Log into RSC
+      ansible.builtin.uri:
+        url: "{{ lookup('env', 'RUBRIK_TOKEN_URL') }}"
+        method: POST
+        headers:
+          Content-Type: "application/json"
+        body_format: "json"
+        body:
+          grant_type: "client_credentials"
+          client_id: "{{ lookup('env', 'RUBRIK_CLIENT_ID') }}"
+          client_secret: "{{ lookup('env', 'RUBRIK_CLIENT_SECRET') }}"
+        return_content: yes
+      register: login_response
+
+
+    - name: Set the authentication token
+      ansible.builtin.set_fact:
+        auth_token: "{{ login_response.json.access_token }}"
+        rsc_base_url: "{{ lookup('env', 'RUBRIK_TOKEN_URL') | regex_search('^(https?://[^/]+)') }}"
+      when: login_response.status == 200
+
+
+    - name: Define GQL Query to get SLA details
+      ansible.builtin.set_fact:
+        gql_query: |
+          query GetSlaDomains {
+            slaDomains {
+              count
+              nodes {
+                ... on GlobalSlaReply {
+                  id
+                  name
+                }
+              }
+            }
+          }
+
+    - name: Call Rubrik API to get SLA details
+      ansible.builtin.uri:
+        url: "{{ lookup('env', 'RUBRIK_API_URL') }}/graphql"
+        method: POST
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ auth_token }}"
+        body_format: "json"
+        body:
+          query: "{{ gql_query }}"
+        return_content: yes
+      register: sla_response
+
+    - name: Print SLA details
+      ansible.builtin.debug:
+        msg: "SLA Details: {{ sla_response.json.data.slaDomains.nodes | map(attribute='name') | list }}"
+
