@@ -2,13 +2,13 @@
 Write-Output "Retrieving SLA details from Rubrik..."
 
 # Import the Rubrik PowerShell module
-Import-Module Rubrik
+Import-Module RubrikSecurityCloud
 # Connect to the Rubrik cluster
 Connect-Rsc
 
 $query = @"
-    query GetSlaDomains($after: String) {
-        slaDomains (after: $after) {
+    query GetSlaDomains(`$after`: String) {
+        slaDomains (after: `$after) {
             pageInfo {
                 startCursor
                 endCursor
@@ -68,11 +68,11 @@ $query = @"
 # Get the SLA Domain details
 $slaDomains = Invoke-Rsc -GqlQuery $query
 
-
+Write-Output($slaDomains.count.edges)
 # Display the SLA Domain details
-$slaDomains | ForEach-Object {
-    Write-Output "SLA Domain Name: $($_.name)"
-    Write-Output "SLA Domain ID: $($_.id)"
+$slaDomains.edges | ForEach-Object {
+    Write-Output "SLA Domain Name: $($_.node.name)"
+    Write-Output "SLA Domain ID: $($_.node.id)"
     Write-Output "----------------------------------------"
 }
 # Disconnect from the Rubrik cluster

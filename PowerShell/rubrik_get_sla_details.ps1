@@ -2,7 +2,7 @@
 Write-Output "Retrieving SLA details from Rubrik..."
 
 # Import the Rubrik PowerShell module
-Import-Module Rubrik
+Import-Module RubrikSecurityCloud
 # Connect to the Rubrik cluster
 Connect-Rsc
 # Get the SLA Domain details

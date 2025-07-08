@@ -154,7 +154,7 @@ class RubrikClient:
 
 # MAIN SCRIPT
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate Dynatrace Synthentic config for Rubrik CDM nodes..")
+    parser = argparse.ArgumentParser(description="Rubrik CDM nodes..")
     parser.add_argument("--client_id", help="Client ID for Rubrik API authentication. Defaults to RUBRIK_CLIENT_ID environment variable if not provided.", default=None)
     parser.add_argument("--client_secret", help="Client Secret for Rubrik API authentication. Defaults to RUBRIK_CLIENT_SECRET environment variable if not provided.", default=None)
     parser.add_argument("--env_name", help="Environment name for the Rubrik Security Cloud instance. Example: 'rscetf' for 'rscetf.my.rubrik.com'. Do not include the domain names.", default=None)
