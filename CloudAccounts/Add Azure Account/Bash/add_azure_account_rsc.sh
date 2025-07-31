@@ -132,9 +132,76 @@ delete_session() {
 authenticate
 
 # --- Step 1: Set Azure Customer App Credentials ---
-echo -e "\n--- Step 1: SKIPPING Azure Customer App Credentials (assuming already configured) ---"
-echo "Skipping credential setup to avoid potential timeout issues..."
+echo -e "\n--- Step 1: Setting Azure Customer App Credentials ---"
+echo -e "\n--- Checking if Azure App already exists in RSC ---"
+STEP1_QUERY='query AllAzureCloudAccountTenants($feature: CloudAccountFeature!, $includeSubscriptionDetails: Boolean!, $azureTenants: [String!]) {
+  allAzureCloudAccountTenants(feature: $feature, includeSubscriptionDetails: $includeSubscriptionDetails, azureTenants: $azureTenants) {
+    domainName
+    clientId
+  }
+}'
+STEP1_VARIABLES=$(jq -n \
+    --arg feature "ALL" \
+    --arg azureTenants "$AZURE_TENANT_DOMAIN_NAME" \
+    --argjson includeSubscriptionDetails true \
+'{
+  feature: $feature,
+  includeSubscriptionDetails: $includeSubscriptionDetails,
+  azureTenants: $azureTenants
+}')
+STEP1_PAYLOAD=$(jq -n \
+    --arg query "$STEP1_QUERY" \
+    --argjson variables "$STEP1_VARIABLES" \
+    '{query: $query, variables: $variables}')
+STEP1_RESPONSE=$(send_graphql_call "$STEP1_PAYLOAD")
+if echo "$STEP1_RESPONSE" | jq -e '.data.allAzureCloudAccountTenants | length > 0' > /dev/null; then
+    echo "Azure App already exists in RSC for tenant: $AZURE_TENANT_DOMAIN_NAME"
+    AZURE_APP_ID=$(echo "$STEP1_RESPONSE" | jq -r '.data.allAzureCloudAccountTenants[0].clientId')
+    echo "Using existing Azure App ID: $AZURE_APP_ID"
+else
+    echo "No existing Azure App found for tenant: $AZURE_TENANT_DOMAIN_NAME"
+    echo "Creating new Azure App in RSC..."
+    STEP1_MUTATION='
+    mutation AzureSetCustomerAppCredentialsMutation($input: SetAzureCloudAccountCustomerAppCredentialsInput!) {
+    setAzureCloudAccountCustomerAppCredentials(input: $input)
+    }
+    '
+    STEP1_VARIABLES=$(jq -n \
+    --arg appId "$AZURE_APP_ID" \
+    --arg appName "$AZURE_APP_NAME" \
+    --arg appSecretKey "$AZURE_APP_SECRET_KEY" \
+    --arg tenantDomainName "$AZURE_TENANT_DOMAIN_NAME" \
+    --arg azureCloudType "$AZURE_CLOUD_TYPE" \
+    --argjson shouldReplace "$SHOULD_REPLACE_APP_CREDS" \
+    '{
+        input: {
+            appId: $appId,
+            appName: $appName,
+            appSecretKey: $appSecretKey,
+            tenantDomainName: $tenantDomainName,
+            azureCloudType: $azureCloudType,
+            shouldReplace: $shouldReplace
+        }
+    }')
 
+    # Construct the full GraphQL payload
+    STEP1_PAYLOAD=$(jq -n \
+    --arg query "$STEP1_MUTATION" \
+    --argjson variables "$STEP1_VARIABLES" \
+    '{query: $query, variables: $variables}')
+
+    echo "Setting Azure customer app credentials for tenant: $AZURE_TENANT_DOMAIN_NAME..."
+    STEP1_RESPONSE=$(send_graphql_call "$STEP1_PAYLOAD")
+    SET_CREDS_SUCCESS=$(echo "$STEP1_RESPONSE" | jq -r '.data.setAzureCloudAccountCustomerAppCredentials')
+
+    if [ "$SET_CREDS_SUCCESS" == "true" ]; then
+        echo "Azure customer app credentials set successfully."
+    else
+        echo "Failed to set Azure customer app credentials. Response: $STEP1_RESPONSE"
+        delete_session
+        exit 1
+    fi
+fi
 # --- Step 2: Get Required Permissions for Azure Role ---
 echo -e "\n--- Step 2: Getting Required Permissions for Azure Role ---"
 STEP2_QUERY='
