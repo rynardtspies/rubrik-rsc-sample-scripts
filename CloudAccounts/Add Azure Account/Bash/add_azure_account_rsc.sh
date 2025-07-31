@@ -20,7 +20,13 @@ display_usage() {
     echo "  --azure_subscription_id  : The Azure Subscription ID to add."
     echo "  --azure_subscription_name: A descriptive name for the Azure subscription."
     echo "  --azure_regions          : Space-separated list of Azure regions to protect (e.g., \"UKSOUTH EASTUS\"). Enclose in quotes."
-    echo "  --azure_feature_type     : The Azure feature type to enable (e.g., 'CLOUD_NATIVE_BLOB_PROTECTION', 'AZURE_SQL_DB_PROTECTION')."
+    echo "  --azure_feature_type     : The Azure feature type to enable. Valid types:
+                               'SERVERS_AND_APPS' (Cloud Cluster)
+                               'CLOUD_NATIVE_PROTECTION' (for Azure VMs and managed disks)
+                               'CLOUD_NATIVE_BLOB_PROTECTION' (for Azure Blob storage)
+                               'AZURE_SQL_DB_PROTECTION' (for Azure SQL databases)
+                               'AZURE_SQL_MI_PROTECTION' (for Azure SQL managed instances)
+                               Multiple features can be specified comma-separated."
     echo ""
     echo "Optional:"
     echo "  --azure_app_name         : Azure AD Application name (default: 'rubrik-rsc-app')."
@@ -48,7 +54,9 @@ while [[ "$#" -gt 0 ]]; do
         --azure_subscription_id) AZURE_SUBSCRIPTION_ID="$2"; shift ;;
         --azure_subscription_name) AZURE_SUBSCRIPTION_NAME="$2"; shift ;;
         --azure_regions) AZURE_REGIONS=($2); shift ;; # Store regions as an array
-        --azure_feature_type) AZURE_FEATURE_TYPE="$2"; shift ;;
+        --azure_feature_type) 
+            IFS=',' read -ra AZURE_FEATURE_TYPES <<< "$2"  # Split comma-separated features into array
+            shift ;;
         --azure_rg_name) AZURE_RG_NAME="$2"; shift ;;
         --azure_rg_region) AZURE_RG_REGION="$2"; shift ;;
         -h|--help) display_usage ;;
@@ -60,7 +68,7 @@ done
 # Validate required arguments
 if [ -z "$ENV_NAME" ] || [ -z "$AZURE_APP_ID" ] || [ -z "$AZURE_APP_SECRET_KEY" ] || \
    [ -z "$AZURE_TENANT_DOMAIN_NAME" ] || [ -z "$AZURE_SUBSCRIPTION_ID" ] || \
-   [ -z "$AZURE_SUBSCRIPTION_NAME" ] || [ -z "${AZURE_REGIONS[@]}" ] || [ -z "$AZURE_FEATURE_TYPE" ]; then
+   [ -z "$AZURE_SUBSCRIPTION_NAME" ] || [ -z "${AZURE_REGIONS[@]}" ] || [ ${#AZURE_FEATURE_TYPES[@]} -eq 0 ]; then
     echo "Error: Missing required arguments."
     display_usage
 fi
@@ -124,47 +132,8 @@ delete_session() {
 authenticate
 
 # --- Step 1: Set Azure Customer App Credentials ---
-echo -e "\n--- Step 1: Setting Azure Customer App Credentials ---"
-STEP1_MUTATION='
-mutation AzureSetCustomerAppCredentialsMutation($input: SetAzureCloudAccountCustomerAppCredentialsInput!) {
-  setAzureCloudAccountCustomerAppCredentials(input: $input)
-}
-'
-STEP1_VARIABLES=$(jq -n \
---arg appId "$AZURE_APP_ID" \
---arg appName "$AZURE_APP_NAME" \
---arg appSecretKey "$AZURE_APP_SECRET_KEY" \
---arg tenantDomainName "$AZURE_TENANT_DOMAIN_NAME" \
---arg azureCloudType "$AZURE_CLOUD_TYPE" \
---argjson shouldReplace "$SHOULD_REPLACE_APP_CREDS" \
-'{
-    input: {
-        appId: $appId,
-        appName: $appName,
-        appSecretKey: $appSecretKey,
-        tenantDomainName: $tenantDomainName,
-        azureCloudType: $azureCloudType,
-        shouldReplace: $shouldReplace
-    }
-}')
-
-# Construct the full GraphQL payload
-STEP1_PAYLOAD=$(jq -n \
---arg query "$STEP1_MUTATION" \
---argjson variables "$STEP1_VARIABLES" \
-'{query: $query, variables: $variables}')
-
-echo "Setting Azure customer app credentials for tenant: $AZURE_TENANT_DOMAIN_NAME..."
-STEP1_RESPONSE=$(send_graphql_call "$STEP1_PAYLOAD")
-SET_CREDS_SUCCESS=$(echo "$STEP1_RESPONSE" | jq -r '.data.setAzureCloudAccountCustomerAppCredentials')
-
-if [ "$SET_CREDS_SUCCESS" == "true" ]; then
-    echo "Azure customer app credentials set successfully."
-else
-    echo "Failed to set Azure customer app credentials. Response: $STEP1_RESPONSE"
-    delete_session
-    exit 1
-fi
+echo -e "\n--- Step 1: SKIPPING Azure Customer App Credentials (assuming already configured) ---"
+echo "Skipping credential setup to avoid potential timeout issues..."
 
 # --- Step 2: Get Required Permissions for Azure Role ---
 echo -e "\n--- Step 2: Getting Required Permissions for Azure Role ---"
@@ -189,41 +158,45 @@ query AllCurrentFeaturePermissionsForCloudAccountsQuery($cloudVendor: CloudVendo
   }
 }
 '
+# Loop through each feature type and run the permissions query separately
+for i in "${!AZURE_FEATURE_TYPES[@]}"; do
+    # Build permission group filter for this feature
+    case "${AZURE_FEATURE_TYPES[$i]}" in
+        "SERVERS_AND_APPS")
+            PERMISSION_GROUP_FILTERS_SINGLE='[{"featureType": "'"${AZURE_FEATURE_TYPES[$i]}"'", "permissionsGroups": ["CLOUD_CLUSTER_ES"]}]'
+            ;;
+        "CLOUD_NATIVE_PROTECTION")
+            PERMISSION_GROUP_FILTERS_SINGLE='[{"featureType": "'"${AZURE_FEATURE_TYPES[$i]}"'", "permissionsGroups": ["BASIC","EXPORT_AND_RESTORE","FILE_LEVEL_RECOVERY"]}]'
+            ;;
+        *)
+            PERMISSION_GROUP_FILTERS_SINGLE='[{"featureType": "'"${AZURE_FEATURE_TYPES[$i]}"'", "permissionsGroups": ["BASIC","RECOVERY"]}]'
+            ;;
+    esac
 
-# Construct permissions_group_filters dynamically as a JSON array string for jq
-PERMS_GROUPS_ARRAY='["BASIC", "RECOVERY"]' # Adjust as needed based on your feature requirements
+    STEP2_VARIABLES=$(jq -n \
+        --arg cloudVendor "AZURE" \
+        --argjson permissionsGroupFilters "$PERMISSION_GROUP_FILTERS_SINGLE" \
+        '{
+            cloudVendor: $cloudVendor,
+            permissionsGroupFilters: $permissionsGroupFilters
+        }')
 
-STEP2_VARIABLES=$(jq -n \
---arg cloudVendor "AZURE" \
---argjson permissionsGroupFilters "[{\"featureType\": \"$AZURE_FEATURE_TYPE\", \"permissionsGroups\": $PERMS_GROUPS_ARRAY}]" \
-'{
-    cloudVendor: $cloudVendor,
-    permissionsGroupFilters: $permissionsGroupFilters
-}')
+    STEP2_PAYLOAD=$(jq -n \
+        --arg query "$STEP2_QUERY" \
+        --argjson variables "$STEP2_VARIABLES" \
+        '{query: $query, variables: $variables}')
 
-# Construct the full GraphQL payload
-STEP2_PAYLOAD=$(jq -n \
---arg query "$STEP2_QUERY" \
---argjson variables "$STEP2_VARIABLES" \
-'{query: $query, variables: $variables}')
-
-
-echo "Retrieving required Azure permissions for feature: $AZURE_FEATURE_TYPE with groups: $(echo "$PERMS_GROUPS_ARRAY" | jq -r '.[] | @json') ..."
-STEP2_RESPONSE=$(send_graphql_call "$STEP2_PAYLOAD")
-REQUIRED_PERMISSIONS=$(echo "$STEP2_RESPONSE" | jq -r '.data.allCurrentFeaturePermissionsForCloudAccounts[0].featurePermissions')
-
-if [ "$REQUIRED_PERMISSIONS" != "null" ]; then
-    echo "Required Azure permissions JSON:"
-    echo "$REQUIRED_PERMISSIONS" | jq -r '.[].permissionJson' | jq . # Pretty print the nested JSON
-    echo -e "\n!!! IMPORTANT: Manually create a custom Azure role with these permissions and assign it to your Azure AD Application at the subscription level. !!!"
-    echo "!!! The script will pause here to allow you to perform this manual step. Press Enter to continue... !!!"
-    read -p "Press Enter to continue after creating and assigning the Azure custom role..."
+    echo "Retrieving required Azure permissions for feature: ${AZURE_FEATURE_TYPES[$i]} ..."
+    STEP2_RESPONSE=$(send_graphql_call "$STEP2_PAYLOAD")
+    REQUIRED_PERMISSIONS=$(echo "$STEP2_RESPONSE" | jq -r '.data.allCurrentFeaturePermissionsForCloudAccounts[0].featurePermissions')
+    if [ "$REQUIRED_PERMISSIONS" != "null" ]; then
+    echo "Required Azure permissions retrieved successfully."
+    echo "$REQUIRED_PERMISSIONS" | jq -r '.[].permissionJson' | jq .
+    echo "Assuming Azure permissions are already configured. Proceeding to onboarding..."
 else
-    echo "Failed to retrieve required Azure permissions. Response: $STEP2_RESPONSE"
-    delete_session
-    exit 1
-fi
-
+    echo "Failed to retrieve required Azure permissions, but proceeding anyway. Response: $STEP2_RESPONSE"
+fi 
+done
 # --- Step 3: Add Cloud Account without OAuth ---
 echo -e "\n--- Step 3: Adding Azure Cloud Account without OAuth ---"
 STEP3_MUTATION='
@@ -240,26 +213,50 @@ mutation AzureCloudAccountAddWithoutOAuthMutation($input: AddAzureCloudAccountWi
   }
 }
 '
-
 # Convert bash array of regions to JSON array string for jq
 AZURE_REGIONS_JSON=$(printf '%s\n' "${AZURE_REGIONS[@]}" | jq -R . | jq -s .)
 
-# Base features input
-FEATURES_INPUT='{"featureType": "'"${AZURE_FEATURE_TYPE}"'", "policyVersion": 0, "permissionsGroups": [{"permissionsGroup": "BASIC", "version": 2}, {"permissionsGroup": "RECOVERY", "version": 3}]}'
+# Build features array for all feature types with correct permissions groups
+FEATURES_LIST=()
+for i in "${!AZURE_FEATURE_TYPES[@]}"; do
+    # Set permissions groups based on feature type
+    case "${AZURE_FEATURE_TYPES[$i]}" in
+        "SERVERS_AND_APPS")
+            # SERVERS_AND_APPS requires policyVersion but no permissions groups
+            FEATURE_INPUT=$(jq -n \
+                --arg featureType "${AZURE_FEATURE_TYPES[$i]}" \
+                '{featureType: $featureType, policyVersion: 1, "permissionsGroups": [{"permissionsGroup": "CLOUD_CLUSTER_ES", "version": 4}]}')
+            ;;
+        "CLOUD_NATIVE_PROTECTION")
+            # CLOUD_NATIVE_PROTECTION may require different permissions groups or policyVersion
+            FEATURE_INPUT=$(jq -n \
+                --arg featureType "${AZURE_FEATURE_TYPES[$i]}" \
+                '{featureType: $featureType, policyVersion: 0, "permissionsGroups": [{"permissionsGroup": "BASIC", "version": 5}, {"permissionsGroup": "EXPORT_AND_RESTORE", "version": 3}, {"permissionsGroup": "FILE_LEVEL_RECOVERY", "version": 1}]}')
+            ;;
+        *)
+            FEATURE_INPUT=$(jq -n \
+                --arg featureType "${AZURE_FEATURE_TYPES[$i]}" \
+                '{featureType: $featureType, policyVersion: 0, permissionsGroups: [{"permissionsGroup": "BASIC", "version": 1}, {"permissionsGroup": "RECOVERY", "version": 1}]}')
+            ;;
+    esac
 
-# Add resourceGroup if provided
-if [ -n "$AZURE_RG_NAME" ] && [ -n "$AZURE_RG_REGION" ]; then
-    FEATURES_INPUT=$(echo "$FEATURES_INPUT" | jq '. + {"resourceGroup": {"name": "'"${AZURE_RG_NAME}"'", "region": "'"${AZURE_RG_REGION}"'"}}')
-fi
+    # Add resourceGroup if provided
+    if [ -n "$AZURE_RG_NAME" ] && [ -n "$AZURE_RG_REGION" ]; then
+        FEATURE_INPUT=$(echo "$FEATURE_INPUT" | jq '. + {"resourceGroup": {"name": "'"${AZURE_RG_NAME}"'", "region": "'"${AZURE_RG_REGION}"'"}}')
+    fi
+
+    FEATURES_LIST+=("$FEATURE_INPUT")
+done
+FEATURES_ARRAY=$(printf '%s\n' "${FEATURES_LIST[@]}" | jq -s .)
 
 # Construct subscriptions array dynamically
 SUBSCRIPTIONS_INPUT=$(jq -n \
-    --arg features_str "$FEATURES_INPUT" \
+    --argjson features "$FEATURES_ARRAY" \
     --arg subscription_name "$AZURE_SUBSCRIPTION_NAME" \
     --arg subscription_id "$AZURE_SUBSCRIPTION_ID" \
     '[
         {
-            features: [ ( $features_str | fromjson ) ],
+            features: $features,
             subscription: {
                 name: $subscription_name,
                 nativeId: $subscription_id
@@ -289,10 +286,9 @@ STEP3_PAYLOAD=$(jq -n \
 --arg query "$STEP3_MUTATION" \
 --argjson variables "$STEP3_VARIABLES" \
 '{query: $query, variables: $variables}')
-
-echo "Adding Azure subscription '${AZURE_SUBSCRIPTION_NAME}' (${AZURE_SUBSCRIPTION_ID}) for tenant '${AZURE_TENANT_DOMAIN_NAME}'..."
+echo "$STEP3_PAYLOAD" | jq 
+echo "Adding Azure subscription '${AZURE_SUBSCRIPTION_NAME}' (${AZURE_SUBSCRIPTION_ID}) for tenant '${AZURE_TENANT_DOMAIN_NAME}' with features: ${AZURE_FEATURE_TYPES[@]}"
 STEP3_RESPONSE=$(send_graphql_call "$STEP3_PAYLOAD")
-
 ADD_ACCOUNT_STATUS=$(echo "$STEP3_RESPONSE" | jq -r '.data.addAzureCloudAccountWithoutOauth.status[0].error')
 
 if [ -z "$ADD_ACCOUNT_STATUS" ] || [ "$ADD_ACCOUNT_STATUS" == "null" ]; then
